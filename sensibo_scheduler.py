@@ -2,12 +2,17 @@
 """
 Sensibo Scheduler for Raspberry Pi
 =================================
-Runs as a background process (or systemd service) and handles two things:
+Runs as a background process (or systemd service) and handles three things:
 
-1. **Weekly schedule** – Every Saturday at 10:00 it enables Climate React, and
-   at 20:00 it disables Climate React (and turns the A/C off).
-2. **Immediate test** – On the day the script starts it will also perform a
-   quick ON/OFF test at 09:00–09:02 to confirm everything works.
+1. **Weekly daytime schedule**
+   • **Thursday**  – ON 10:00, OFF 20:00.
+   • **Friday**    – ON 10:00, OFF 23:00.
+   • **Saturday**  – ON 10:00, OFF 20:00.
+2. **Nightly cooling window** – Every night at 01:30 Climate React is enabled
+   for 1.5 hours and then switched off together with the A/C (OFF at 03:00).
+3. **Immediate self-test** – When the script starts it flips Climate React ON
+   one minute after launch, waits two minutes, then turns it OFF alongside the
+   A/C to verify everything works.
 
 Usage
 -----
@@ -106,9 +111,20 @@ def main() -> None:
 
     sched = _Scheduler(timezone=tz_obj)
 
-    # Weekly Saturday jobs
+    # ─────────── Recurring schedules ───────────
+    # Weekly daytime windows (ON at 10:00)
+    sched.add_job(enable_cr, _Cron(day_of_week="thu", hour=10, minute=0), args=[pod_id], id="thu_enable")
+    sched.add_job(enable_cr, _Cron(day_of_week="fri", hour=10, minute=0), args=[pod_id], id="fri_enable")
     sched.add_job(enable_cr, _Cron(day_of_week="sat", hour=10, minute=0), args=[pod_id], id="sat_enable")
+
+    # Corresponding OFF times
+    sched.add_job(disable_cr_and_ac, _Cron(day_of_week="thu", hour=20, minute=0), args=[pod_id], id="thu_disable")
+    sched.add_job(disable_cr_and_ac, _Cron(day_of_week="fri", hour=23, minute=0), args=[pod_id], id="fri_disable")
     sched.add_job(disable_cr_and_ac, _Cron(day_of_week="sat", hour=20, minute=0), args=[pod_id], id="sat_disable")
+
+    # Nightly cooling window – ON at 01:30, OFF at 03:00 (every day)
+    sched.add_job(enable_cr, _Cron(hour=1, minute=30), args=[pod_id], id="nightly_enable")
+    sched.add_job(disable_cr_and_ac, _Cron(hour=3, minute=0), args=[pod_id], id="nightly_disable")
 
     # Immediate test: turn ON 1 minute after startup, OFF 2 minutes later
     now = _dt.datetime.now()
