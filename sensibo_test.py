@@ -20,7 +20,11 @@ import datetime as _dt
 import os as _os
 import sys as _sys
 import time as _time
-from typing import Final as _Final
+# --- Python ≤ 3.7 compatibility: Final from typing_extensions ---
+try:
+    from typing import Final as _Final  # Python ≥ 3.8
+except ImportError:  # Python ≤ 3.7
+    from typing_extensions import Final as _Final  # type: ignore
 
 import requests as _rq
 
