@@ -1,27 +1,12 @@
 #!/usr/bin/env python3
 """
-Sensibo Shabbat Scheduler
-=========================
-Single 5-minute monitor job that:
-
-* **Enters** a climate window → turns Climate React (CR) ON.
-* **Leaves** the window        → CR OFF **and** AC OFF immediately.
-* While inside a window, applies smart fallback:
-    • Temp ≥ 23.5 °C **and** AC OFF  → force AC ON.  
-    • AC ON **but** temperature rising → force AC ON again.
-* Cool-down: 15 min between forced-ON interventions.
-* Caches CR/AC state for 10 min to spare API quota.
-* Resilient: every API call retried; failures only log,
-  never crash the scheduler.
-* Handles one pod automatically or a specific one via
-  `SENSIBO_POD_ID`.
-
-Climate windows (local time, default Asia/Jerusalem)
-----------------------------------------------------
-* Nightly 01:30-03:00 **every day**
-* Thu 10-20, Fri 10-23, Sat 10-20
-
-Python ≥ 3.9 required (needs zoneinfo).
+Sensibo Fallback Scheduler – final spec
+======================================
+• Turns Climate-React ON  at 09:00 and OFF at 20:00 (Thu/Fri/Sat).
+• Runs a 5-min fallback monitor only inside that 09–20 window.
+• Nightly hard window: CR ON 01:30, CR OFF + AC OFF 03:00 (no monitoring).
+• Fallback sends **AC ON** if CR thinks AC is on but the room keeps heating.
+• Cool-down 15 min, high threshold 24.5 °C.
 """
 
 from __future__ import annotations
@@ -34,11 +19,12 @@ from typing import Dict, Final, Optional, Tuple
 
 import requests
 from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ─────────── Configuration ───────────
+# ─────────── Config ───────────
 _API_BASE: Final[str] = "https://home.sensibo.com/api/v2"
 _API_KEY:  Final[str] = os.getenv("SENSIBO_API_KEY")
 _POD_ID:   Final[str | None] = os.getenv("SENSIBO_POD_ID")
@@ -46,11 +32,10 @@ _POD_ID:   Final[str | None] = os.getenv("SENSIBO_POD_ID")
 if not _API_KEY:
     sys.exit("SENSIBO_API_KEY env var missing — aborting.")
 
-_TEMP_HIGH = 23.5      # °C → trigger AC ON
-_COOLDOWN_MIN = 15     # minutes between interventions
-_STATE_TTL   = 600     # seconds to cache CR/AC state
+_TEMP_HIGH      = 24.5      # °C → trigger fallback
+_COOLDOWN_MIN   = 15        # minutes between interventions
+_STATE_TTL      = 600       # seconds to cache CR / AC state
 
-# ─────────── Logging ───────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s — %(message)s",
@@ -58,9 +43,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("sensibo")
 
-# ─────────── HTTP session (retry) ───────────
+# ─────────── HTTP session ───────────
 _session = requests.Session()
-_session.headers["User-Agent"] = "SensiboScheduler/1.0"
+_session.headers["User-Agent"] = "SensiboFallback/1.0"
 _session.mount(
     "https://",
     HTTPAdapter(
@@ -86,10 +71,7 @@ def _api_get(path: str, **params):
 def _api_post(path: str, json: Dict):
     try:
         r = _session.post(
-            f"{_API_BASE}{path}",
-            params={"apiKey": _API_KEY},
-            json=json,
-            timeout=10,
+            f"{_API_BASE}{path}", params={"apiKey": _API_KEY}, json=json, timeout=10
         )
         r.raise_for_status()
     except Exception as e:
@@ -151,22 +133,22 @@ def _temperature(pod_id: str) -> Optional[float]:
     try:
         ts = dt.datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
         if (dt.datetime.utcnow() - ts).total_seconds() > 600:
-            return None    # stale reading
+            return None
     except Exception:
         pass
     return temp
 
-# ─────────── Temperature monitor ───────────
+# ─────────── Temp monitor ───────────
 class _TempMon:
     def __init__(self, window: int = 3):
         self.window = window
         self.history: list[Tuple[dt.datetime, float]] = []
         self.last_intervention: Optional[dt.datetime] = None
 
-    def add(self, value: float):
+    def add(self, v: float):
         now = dt.datetime.utcnow()
-        self.history.append((now, value))
-        del self.history[:-24]  # keep last ~2 h
+        self.history.append((now, v))
+        del self.history[:-24]
 
     def rising(self) -> bool:
         if len(self.history) < self.window:
@@ -186,19 +168,11 @@ class _TempMon:
 
 _temp_mon = _TempMon()
 
-# ─────────── Window helper ───────────
-def _in_active_window(now: dt.datetime) -> bool:
-    dow = now.weekday()      # 0=Mon … 6=Sun
+# ─────────── Helpers ───────────
+def _within_day_window(now: dt.datetime) -> bool:
+    dow = now.weekday()  # 3=Thu, 4=Fri, 5=Sat
     t = now.time()
-    if dt.time(1, 30) <= t < dt.time(3, 0):
-        return True
-    if dow == 3 and dt.time(10) <= t < dt.time(20):
-        return True
-    if dow == 4 and dt.time(10) <= t < dt.time(23):
-        return True
-    if dow == 5 and dt.time(10) <= t < dt.time(20):
-        return True
-    return False
+    return dow in (3, 4, 5) and dt.time(9) <= t < dt.time(20)
 
 # ─────────── Actuators ───────────
 def _set_cr(pod_id: str, enable: bool):
@@ -211,49 +185,26 @@ def _set_ac_power(pod_id: str, on: bool):
     log.info("AC power     → %s", "ON" if on else "OFF")
     _state_cache.pop(f"ac:{pod_id}", None)
 
-# ─────────── Monitor job ───────────
-def monitor_job(pod_id: str, tz):
-    now_local = dt.datetime.now(tz)
-    in_window = _in_active_window(now_local)
-
-    cr_on  = _is_cr_enabled(pod_id)
-    ac_on  = _ac_state(pod_id).get("on", False)
-
-    # ----- Outside any window: make sure everything is OFF -----
-    if not in_window:
-        if cr_on or ac_on:
-            log.info("Outside window — turning CR + AC OFF")
-            if cr_on:
-                _set_cr(pod_id, False)
-            if ac_on:
-                _set_ac_power(pod_id, False)
+# ─────────── Fallback monitor ───────────
+def fallback_monitor(pod_id: str, tz):
+    now = dt.datetime.now(tz)
+    if not _within_day_window(now):
         return
 
-    # ----- Inside a window -----
-    temp = _temperature(pod_id)
-    if temp is None:
-        log.warning("No fresh temperature reading; skipping this cycle")
-        return
-
-    _temp_mon.add(temp)
-    log.debug(
-        "%s  Temp %.1f °C  CR %s  AC %s",
-        now_local.strftime("%a %H:%M"),
-        temp,
-        "ON" if cr_on else "OFF",
-        "ON" if ac_on else "OFF",
-    )
-
-    # Ensure CR enabled at window start
+    cr_on = _is_cr_enabled(pod_id)
     if not cr_on:
-        _set_cr(pod_id, True)
-        cr_on = True
+        return  # user turned CR off; respect that
 
-    # Fallback logic
+    ac_on = _ac_state(pod_id).get("on", False)
+    temp  = _temperature(pod_id)
+    if temp is None:
+        return
+    _temp_mon.add(temp)
+
     reason = None
     if _temp_mon.cooldown_ok():
         if temp >= _TEMP_HIGH and not ac_on:
-            reason = "AC OFF & temp high"
+            reason = "AC OFF & temp ≥ threshold"
         elif ac_on and _temp_mon.rising():
             reason = "Temp rising while AC ON"
 
@@ -261,6 +212,25 @@ def monitor_job(pod_id: str, tz):
         log.warning("Intervention: %s (%.1f °C)", reason, temp)
         _set_ac_power(pod_id, True)
         _temp_mon.mark()
+
+# ─────────── Scheduled jobs ───────────
+def day_start(pod_id: str):
+    log.info("09:00 — enabling Climate React")
+    _set_cr(pod_id, True)
+
+def day_end(pod_id: str):
+    log.info("20:00 — disabling CR and powering AC OFF")
+    _set_cr(pod_id, False)
+    _set_ac_power(pod_id, False)
+
+def nightly_on(pod_id: str):
+    log.info("01:30 — nightly ON (CR enable)")
+    _set_cr(pod_id, True)
+
+def nightly_off(pod_id: str):
+    log.info("03:00 — nightly OFF (CR disable + AC OFF)")
+    _set_cr(pod_id, False)
+    _set_ac_power(pod_id, False)
 
 # ─────────── Main ───────────
 def main():
@@ -275,19 +245,30 @@ def main():
         log.warning("Timezone %s not found — using UTC", tz_name)
 
     sched = BlockingScheduler(
-        timezone=tz,
-        job_defaults={"coalesce": True, "max_instances": 1},
+        timezone=tz, job_defaults={"coalesce": True, "max_instances": 1}
     )
 
-    # 5-min unified monitor
+    # Daily 5-min monitor (checked every cycle but active only in window)
     sched.add_job(
-        monitor_job,
+        fallback_monitor,
         IntervalTrigger(minutes=5),
         args=[pod_id, tz],
-        id="sensibo_monitor",
+        id="fallback_monitor",
     )
 
-    log.info("Scheduler started (pod %s, zone %s)", pod_id, tz_name)
+    # Daytime on/off Thu/Fri/Sat
+    sched.add_job(day_start, CronTrigger(day_of_week="thu,fri,sat", hour=9, minute=0),
+                  args=[pod_id], id="day_start")
+    sched.add_job(day_end,   CronTrigger(day_of_week="thu,fri,sat", hour=20, minute=0),
+                  args=[pod_id], id="day_end")
+
+    # Nightly hard window (every day)
+    sched.add_job(nightly_on,  CronTrigger(hour=1, minute=30),
+                  args=[pod_id], id="nightly_on")
+    sched.add_job(nightly_off, CronTrigger(hour=3, minute=0),
+                  args=[pod_id], id="nightly_off")
+
+    log.info("Scheduler running (pod %s, zone %s)", pod_id, tz_name)
     try:
         sched.start()
     except (KeyboardInterrupt, SystemExit):
